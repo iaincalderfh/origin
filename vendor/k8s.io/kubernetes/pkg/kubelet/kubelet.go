@@ -2084,8 +2084,6 @@ func (kl *Kubelet) getPullSecretsForPod(pod *api.Pod) ([]api.Secret, error) {
 	return pullSecrets, nil
 }
 
-// cleanupOrphanedPodDirs removes the volumes of pods that should not be
-// running and that have no containers running.
 func (kl *Kubelet) cleanupOrphanedPodDirs(
 	pods []*api.Pod, runningPods []*kubecontainer.Pod) error {
 	allPods := sets.NewString()
@@ -2105,20 +2103,67 @@ func (kl *Kubelet) cleanupOrphanedPodDirs(
 		if allPods.Has(string(uid)) {
 			continue
 		}
+		// If volumes have not been unmounted/detached, do not delete directory.
+		// Doing so may result in corruption of data.
 		if podVolumesExist := kl.podVolumesExist(uid); podVolumesExist {
-			// If volumes have not been unmounted/detached, do not delete directory.
-			// Doing so may result in corruption of data.
-			glog.V(3).Infof("Orphaned pod %q found, but volumes are not cleaned up; err: %v", uid, err)
+			glog.V(3).Infof("Orphaned pod %q found, but volumes are not cleaned up", uid)
+			continue
+		}
+		// Check whether volume is still mounted on disk. If so, do not delete directory
+		volumePaths, err := kl.getPodVolumePathListFromDisk(uid)
+		if err != nil {
+			glog.Errorf("Orphaned pod %q found, but error %v occured during reading volume dir from disk", uid, err)
+			continue
+		} else if len(volumePaths) > 0 {
+			for _, path := range volumePaths {
+				notMount, err := kl.mounter.IsLikelyNotMountPoint(path)
+				if err == nil && notMount {
+					glog.V(2).Infof("Volume path %q is no longer mounted, remove it", path)
+					os.Remove(path)
+				} else {
+					if !notMount {
+						glog.Errorf("Orphaned pod cleanup: volume path %q is still mounted, attempting to unmount", path)
+						if err = kl.mounter.Unmount(path); err != nil {
+							glog.Errorf("Orphaned pod cleanup: volume path %q unmount failed with error %v", path, err)
+						}
+					}
+					glog.Errorf("Orphaned pod %q found, but it might still be mounted with error %v", uid, err)
+				}
+			}
 			continue
 		}
 
 		glog.V(3).Infof("Orphaned pod %q found, removing", uid)
 		if err := os.RemoveAll(kl.getPodDir(uid)); err != nil {
-			glog.Infof("Failed to remove orphaned pod %q dir; err: %v", uid, err)
+			glog.Errorf("Failed to remove orphaned pod %q dir; err: %v", uid, err)
 			errlist = append(errlist, err)
 		}
 	}
 	return utilerrors.NewAggregate(errlist)
+}
+
+// getPodVolumePathListFromDisk returns a list of the volume paths by reading the
+// volume directories for the given pod from the disk.
+func (kl *Kubelet) getPodVolumePathListFromDisk(podUID types.UID) ([]string, error) {
+	volumes := []string{}
+	podVolDir := kl.getPodVolumesDir(podUID)
+	volumePluginDirs, err := ioutil.ReadDir(podVolDir)
+	if err != nil {
+		glog.Errorf("Could not read directory %s: %v", podVolDir, err)
+		return volumes, err
+	}
+	for _, volumePluginDir := range volumePluginDirs {
+		volumePluginName := volumePluginDir.Name()
+		volumePluginPath := path.Join(podVolDir, volumePluginName)
+		volumeDirs, err := util.ReadDirNoStat(volumePluginPath)
+		if err != nil {
+			return volumes, fmt.Errorf("Could not read directory %s: %v", volumePluginPath, err)
+		}
+		for _, volumeDir := range volumeDirs {
+			volumes = append(volumes, path.Join(volumePluginPath, volumeDir))
+		}
+	}
+	return volumes, nil
 }
 
 // cleanupBandwidthLimits updates the status of bandwidth-limited containers

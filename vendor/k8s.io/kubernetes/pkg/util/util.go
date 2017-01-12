@@ -116,6 +116,22 @@ func ReadDirNoExit(dirname string) ([]os.FileInfo, []error, error) {
 	return list, errs, nil
 }
 
+// ReadDirNoStat returns a string of files/directories contained
+// in dirname without calling lstat on them.
+func ReadDirNoStat(dirname string) ([]string, error) {
+	if dirname == "" {
+		dirname = "."
+	}
+
+	f, err := os.Open(dirname)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	return f.Readdirnames(-1)
+}
+
 // IntPtr returns a pointer to an int
 func IntPtr(i int) *int {
 	o := i
